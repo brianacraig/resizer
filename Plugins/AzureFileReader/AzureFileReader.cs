@@ -17,6 +17,7 @@ using ImageResizer.ExtensionMethods;
 using System.IO;
 using System.Threading.Tasks;
 using Microsoft.Azure;
+using System.Runtime.Caching;
 
 namespace ImageResizer.Plugins.AzureFileReader {
 
@@ -25,6 +26,7 @@ namespace ImageResizer.Plugins.AzureFileReader {
         public CloudFileClient CloudFileClient { get; set; }
         string fileStorageConnection;
         string fileStorageEndpoint;
+        int rootDirectoryCacheInMinutes;
 
         public AzureFileReaderPlugin()
             : base()
@@ -36,6 +38,8 @@ namespace ImageResizer.Plugins.AzureFileReader {
             LoadConfiguration(args);
             fileStorageConnection = args["connectionstring"];
             fileStorageEndpoint = args.GetAsString("filestorageendpoint", args.GetAsString("endpoint",null));
+            string rootDirectCacheTime = args.GetAsString("rootDirectoryCacheInMinutes", "0");
+            rootDirectoryCacheInMinutes = int.Parse(rootDirectCacheTime);
         }
 
 
@@ -48,10 +52,36 @@ namespace ImageResizer.Plugins.AzureFileReader {
             string shareName = subPath.Substring(0, subPath.IndexOf('/'));
             string fileName = subPath.Substring(shareName.Length+1);
 
-            var shareReference = CloudFileClient.GetShareReference(shareName);
-            var rootDirectory = shareReference.GetRootDirectoryReference();
-
+            CloudFileDirectory rootDirectory = GetRootFromCache(shareName);
             return rootDirectory.GetFileReference(fileName);
+        }
+
+        private CloudFileDirectory GetRootFromCache(string shareName) {
+            if (rootDirectoryCacheInMinutes <= 0) {
+                return GetDirectoryRootFromAzure(shareName);
+            }
+
+            string cacheKey = $"RootDirectory_{shareName}";
+
+            Lazy<CloudFileDirectory> lazyRoot = new Lazy<CloudFileDirectory>(() => GetDirectoryRootFromAzure(shareName));
+            var item = (Lazy<CloudFileDirectory>)MemoryCache.Default.AddOrGetExisting(cacheKey, lazyRoot, System.DateTime.Now.AddMinutes(rootDirectoryCacheInMinutes)) ?? lazyRoot;
+            
+            // Double check that we're not caching an error result.
+            try {
+                if (item.Value == null) {
+                    MemoryCache.Default.Remove(cacheKey);
+                }
+            } catch (Exception) {
+                MemoryCache.Default.Remove(cacheKey);
+            }
+
+            return item.Value;
+        }
+
+        private CloudFileDirectory GetDirectoryRootFromAzure(string shareName) 
+        {
+            var shareReference = CloudFileClient.GetShareReference(shareName);
+            return shareReference.GetRootDirectoryReference();
         }
 
         public override async Task<Stream> OpenAsync(string virtualPath, NameValueCollection queryString)
@@ -66,11 +96,18 @@ namespace ImageResizer.Plugins.AzureFileReader {
             }
             catch (StorageException e)
             {
+                ms.Close();
+                ms.Dispose();
                 if (e.RequestInformation.HttpStatusCode == 404)
                 {
                     throw new FileNotFoundException("Azure file not found", e);
                 }
                 throw;
+            } 
+            catch (Exception) 
+            { 
+                ms.Close();
+                ms.Dispose();
             }
 
             ms.Seek(0, SeekOrigin.Begin); // Reset to beginning
